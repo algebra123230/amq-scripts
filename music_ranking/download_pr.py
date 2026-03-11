@@ -137,7 +137,7 @@ def download_raw(url: str, dest_base: Path) -> Path:
             raise RuntimeError(result.stderr.strip() or f"yt-dlp exited {result.returncode}")
         candidates = [
             f for f in dest_base.parent.iterdir()
-            if f.name.startswith(dest_base.name + ".") and f.suffix not in (".mp3", ".part")
+            if f.stem == dest_base.name and f.suffix not in (".mp3", ".part")
         ]
         if not candidates:
             raise FileNotFoundError(f"yt-dlp produced no output file for {url}")
@@ -156,14 +156,16 @@ def download_raw(url: str, dest_base: Path) -> Path:
 
 def convert_to_mp3(raw_file: Path, mp3_dest: Path):
     """Convert raw_file → mp3_dest with ffmpeg."""
-    subprocess.run(
+    result = subprocess.run(
         ["ffmpeg", "-i", str(raw_file), "-vn", "-acodec", "libmp3lame", "-q:a", "2",
          "-y", str(mp3_dest)],
-        check=True,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
     )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"ffmpeg exited {result.returncode}")
 
 
 # ---------------------------------------------------------------------------
