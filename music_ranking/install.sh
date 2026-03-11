@@ -14,6 +14,13 @@ else
     echo "ffmpeg already installed: $(ffmpeg -version 2>&1 | head -1)"
 fi
 
+if ! command -v deno &>/dev/null; then
+    echo "Installing deno (JS runtime for yt-dlp)..."
+    brew install deno
+else
+    echo "deno already installed: $(deno --version | head -1)"
+fi
+
 # Set up Python venv
 python3 -m venv venv
 source venv/bin/activate
