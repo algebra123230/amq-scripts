@@ -1,40 +1,43 @@
 #!/usr/bin/env python3
 """
-Download mp3/audio files from an anime music Power Ranking Google Sheet.
+Download songs from an anime music Power Ranking Google Sheet as mp3.
 
 Setup:
-    python3 -m venv venv
-    source venv/bin/activate
-    pip install -r requirements.txt
+    ./install.sh
 
 Usage:
-    python download_pr.py <google_sheet_url>
+    python download_pr.py <google_sheet_url> [--download-threads N] [--convert-threads M]
 """
 
 import re
 import sys
 import subprocess
 import io
+import argparse
+import threading
+import queue
 from datetime import date
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 import openpyxl
 
 
+# ---------------------------------------------------------------------------
+# Sheet parsing
+# ---------------------------------------------------------------------------
+
 def parse_sheet_id(url: str) -> str:
-    """Extract Google Sheets ID from a URL or return the string as-is if it's already an ID."""
     match = re.search(r'/spreadsheets/d/([a-zA-Z0-9_-]+)', url)
     if match:
         return match.group(1)
-    # Maybe it's just the raw ID
     if re.match(r'^[a-zA-Z0-9_-]+$', url):
         return url
     raise ValueError(f"Could not parse Google Sheet ID from: {url}")
 
 
 def download_xlsx(sheet_id: str) -> bytes:
-    """Download the Google Sheet as XLSX bytes."""
     url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
     print(f"Fetching sheet: {url}")
     resp = requests.get(url, timeout=30)
@@ -43,82 +46,66 @@ def download_xlsx(sheet_id: str) -> bytes:
 
 
 def find_header_row(ws):
-    """Return (row_index, col_map) where col_map maps column names to 1-based col indices."""
     for row in ws.iter_rows():
         values = [str(c.value).strip().lower() if c.value is not None else "" for c in row]
         if "id" in values and any("anime" in v for v in values):
-            col_map = {}
-            for cell in row:
-                if cell.value is not None:
-                    col_map[str(cell.value).strip().lower()] = cell.column
+            col_map = {str(cell.value).strip().lower(): cell.column
+                       for cell in row if cell.value is not None}
             return row[0].row, col_map
-    raise ValueError("Could not find header row. Expected columns: ID, Anime Name, Song Info, mp3 Links")
+    raise ValueError("Could not find header row (expected columns: ID, Anime Name, Song Info)")
 
 
 def parse_song_info(text: str):
     """Parse '"Song Title" by Artist' into (title, artist)."""
     if not text:
         return "", ""
-    # Match: "Title" by Artist  (with optional curly/smart quotes)
     m = re.match(r'^["\u201c\u300c](.+?)["\u201d\u300d]\s+by\s+(.+)$', text.strip())
     if m:
         return m.group(1).strip(), m.group(2).strip()
-    # Fallback: split on ' by '
     parts = text.split(" by ", 1)
     if len(parts) == 2:
         return parts[0].strip().strip('"'), parts[1].strip()
     return text.strip(), ""
 
 
-def sanitize(name: str) -> str:
-    """Replace filesystem-unsafe characters with underscores."""
-    name = re.sub(r'[/\\:*?"<>|]', '_', name)
-    name = re.sub(r'\s+', '_', name)
-    return name.strip('_')
-
-
 def get_cell_url(cell) -> str | None:
-    """Extract URL from a cell's hyperlink or value."""
     if cell.hyperlink:
         target = cell.hyperlink.target if hasattr(cell.hyperlink, 'target') else str(cell.hyperlink)
         if target:
             return target
     val = str(cell.value).strip() if cell.value else ""
-    if val.startswith("http"):
-        return val
-    return None
-
-
-MIN_FILE_SIZE = 10 * 1024  # 10 KB — treat smaller files as incomplete
-
-
-def already_downloaded(out_dir: Path, id_prefix: str) -> bool:
-    """Check if a reasonably-sized file starting with id_prefix exists in out_dir."""
-    return any(
-        f.stat().st_size >= MIN_FILE_SIZE
-        for f in out_dir.glob(f"{id_prefix}_*")
-    )
-
-
-def download_as_mp3(url: str, dest_base: Path):
-    """Download any URL as mp3 using yt-dlp (works for YouTube and direct video/audio files)."""
-    output_template = str(dest_base) + ".%(ext)s"
-    subprocess.run(
-        ["yt-dlp", "-x", "--audio-format", "mp3", "-o", output_template, url],
-        check=True
-    )
+    return val if val.startswith("http") else None
 
 
 def find_mp3_column(col_map: dict) -> int | None:
-    """Find the mp3 links column index from the header map."""
     for key in col_map:
         if "mp3" in key or "audio" in key:
             return col_map[key]
     return None
 
 
+def sanitize(name: str) -> str:
+    name = re.sub(r'[/\\:*?"<>|]', '_', name)
+    name = re.sub(r'\s+', '_', name)
+    return name.strip('_')
+
+
+# ---------------------------------------------------------------------------
+# Filesystem helpers
+# ---------------------------------------------------------------------------
+
+MIN_FILE_SIZE = 10 * 1024  # 10 KB
+
+
+def already_downloaded(out_dir: Path, id_prefix: str) -> bool:
+    """True if a reasonably-sized .mp3 with this ID prefix already exists."""
+    return any(
+        f.stat().st_size >= MIN_FILE_SIZE
+        for f in out_dir.glob(f"{id_prefix}_*.mp3")
+    )
+
+
 def git_root() -> Path:
-    """Find the git repository root."""
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
@@ -129,23 +116,123 @@ def git_root() -> Path:
         return Path(__file__).parent.parent
 
 
+# ---------------------------------------------------------------------------
+# Download + convert (two separate stages for threading)
+# ---------------------------------------------------------------------------
+
+def download_raw(url: str, dest_base: Path) -> Path:
+    """Download to dest_base.<ext> and return the path. No conversion."""
+    is_youtube = "youtube.com" in url or "youtu.be" in url
+    if is_youtube:
+        output_template = str(dest_base) + ".%(ext)s"
+        subprocess.run(
+            ["yt-dlp", "-f", "bestaudio", "--no-playlist", "-q",
+             "-o", output_template, url],
+            check=True,
+        )
+        candidates = [
+            f for f in dest_base.parent.glob(dest_base.name + ".*")
+            if f.suffix not in (".mp3", ".part")
+        ]
+        if not candidates:
+            raise FileNotFoundError(f"yt-dlp produced no output file for {url}")
+        return candidates[0]
+    else:
+        resp = requests.get(url, stream=True, timeout=120)
+        resp.raise_for_status()
+        ext = Path(urlparse(url).path).suffix or ".webm"
+        dest = Path(str(dest_base) + ext)
+        with open(dest, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=65536):
+                f.write(chunk)
+        return dest
+
+
+def convert_to_mp3(raw_file: Path, mp3_dest: Path):
+    """Convert raw_file to mp3_dest with ffmpeg."""
+    subprocess.run(
+        ["ffmpeg", "-i", str(raw_file), "-vn", "-acodec", "libmp3lame", "-q:a", "2",
+         "-y", str(mp3_dest)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Worker threads
+# ---------------------------------------------------------------------------
+
+_print_lock = threading.Lock()
+
+def log(msg: str):
+    with _print_lock:
+        print(msg, flush=True)
+
+
+_STOP = object()  # sentinel
+
+
+def download_worker(dl_queue, conv_queue):
+    while True:
+        item = dl_queue.get()
+        if item is _STOP:
+            dl_queue.task_done()
+            break
+        idx, n_total, base_name, media_url, mp3_dest = item
+        log(f"[{idx}/{n_total}] ↓ {base_name}")
+        try:
+            dest_base = mp3_dest.with_suffix("")
+            raw_file = download_raw(media_url, dest_base)
+            conv_queue.put((idx, n_total, base_name, raw_file, mp3_dest))
+        except Exception as e:
+            log(f"  ERROR downloading [{idx}] {base_name}: {e}")
+        dl_queue.task_done()
+
+
+def convert_worker(conv_queue, raw_files_lock, raw_files_converted):
+    while True:
+        item = conv_queue.get()
+        if item is _STOP:
+            conv_queue.task_done()
+            break
+        idx, n_total, base_name, raw_file, mp3_dest = item
+        log(f"[{idx}/{n_total}] ♪ {base_name}")
+        try:
+            convert_to_mp3(raw_file, mp3_dest)
+            with raw_files_lock:
+                raw_files_converted.append(raw_file)
+        except Exception as e:
+            log(f"  ERROR converting [{idx}] {base_name}: {e}")
+        conv_queue.task_done()
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
-    if len(sys.argv) < 2:
-        print(f"Usage: python {sys.argv[0]} <google_sheet_url>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Download PR songs as mp3.")
+    parser.add_argument("sheet_url", help="Google Sheet URL or sheet ID")
+    parser.add_argument("--download-threads", type=int, default=2, metavar="N",
+                        help="Parallel download threads (default: 2)")
+    parser.add_argument("--convert-threads", type=int, default=2, metavar="M",
+                        help="Parallel ffmpeg conversion threads (default: 2)")
+    parser.add_argument("--output-dir", metavar="DIR",
+                        help="Output directory name under media/ (default: prompt)")
+    args = parser.parse_args()
 
-    sheet_url = sys.argv[1]
-    sheet_id = parse_sheet_id(sheet_url)
+    sheet_id = parse_sheet_id(args.sheet_url)
 
-    # Prompt for output directory
     today = date.today().strftime("%Y-%m-%d")
-    dir_name = input(f"Output directory name [{today}]: ").strip() or today
-
+    if args.output_dir:
+        dir_name = args.output_dir
+    else:
+        dir_name = input(f"Output directory name [{today}]: ").strip() or today
     out_dir = git_root() / "media" / dir_name
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Saving to: {out_dir}")
 
-    # Download and parse XLSX
     xlsx_bytes = download_xlsx(sheet_id)
     wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes))
     ws = wb.active
@@ -153,7 +240,6 @@ def main():
     header_row, col_map = find_header_row(ws)
     print(f"Found headers: {list(col_map.keys())}")
 
-    # Locate required columns
     id_col = col_map.get("id")
     anime_col = next((col_map[k] for k in col_map if "anime" in k), None)
     song_info_col = next((col_map[k] for k in col_map if "song info" in k or "song title" in k), None)
@@ -161,15 +247,11 @@ def main():
 
     if not all([id_col, anime_col, song_info_col]):
         print(f"ERROR: Missing required columns. Found: {list(col_map.keys())}")
-        print("Expected columns containing: id, anime, song info")
         sys.exit(1)
 
-    if mp3_col:
-        print("mp3 column found — will use mp3 links.")
-    else:
-        print("No mp3 column — will use Song Info links.")
+    print("mp3 column found — will use mp3 links." if mp3_col
+          else "No mp3 column — will use Song Info links.")
 
-    # Collect rows
     songs = []
     for row in ws.iter_rows(min_row=header_row + 1):
         id_cell = row[id_col - 1]
@@ -181,32 +263,73 @@ def main():
             continue
         anime = str(row[anime_col - 1].value or "").strip()
         song_info_cell = row[song_info_col - 1]
-        song_info_text = str(song_info_cell.value or "").strip()
-        title, artist = parse_song_info(song_info_text)
+        title, artist = parse_song_info(str(song_info_cell.value or ""))
         media_url = get_cell_url(row[mp3_col - 1]) if mp3_col else get_cell_url(song_info_cell)
         songs.append((song_id, anime, title, artist, media_url))
 
-    total = len(songs)
-    print(f"Found {total} songs.")
-
-    for i, (song_id, anime, title, artist, media_url) in enumerate(songs, 1):
+    pending = []
+    skipped = 0
+    for song_id, anime, title, artist, media_url in songs:
         id_prefix = f"{song_id:02d}"
         base_name = sanitize(f"{id_prefix}_{anime}_{title}_by_{artist}")
-        print(f"[{i}/{total}] {base_name}", end="")
-
+        mp3_dest = out_dir / f"{base_name}.mp3"
         if already_downloaded(out_dir, id_prefix):
-            print(" (skipped, already exists)")
-            continue
+            skipped += 1
+        elif not media_url:
+            log(f"  (no URL) {base_name}")
+            skipped += 1
+        else:
+            pending.append((base_name, media_url, mp3_dest))
 
-        if not media_url:
-            print(" (skipped, no URL)")
-            continue
+    n_total = len(pending)
+    print(f"{len(songs)} songs found. {skipped} skipped, {n_total} to download.")
+    if n_total == 0:
+        print("Nothing to do.")
+        return
 
-        print()
-        try:
-            download_as_mp3(media_url, out_dir / base_name)
-        except Exception as e:
-            print(f"  ERROR: {e}")
+    dl_queue: queue.Queue = queue.Queue()
+    conv_queue: queue.Queue = queue.Queue()
+    raw_files_converted: list[Path] = []
+    raw_files_lock = threading.Lock()
+
+    for idx, (base_name, media_url, mp3_dest) in enumerate(pending, 1):
+        dl_queue.put((idx, n_total, base_name, media_url, mp3_dest))
+
+    conv_threads = [
+        threading.Thread(target=convert_worker,
+                         args=(conv_queue, raw_files_lock, raw_files_converted),
+                         daemon=True)
+        for _ in range(args.convert_threads)
+    ]
+    for t in conv_threads:
+        t.start()
+
+    dl_threads = [
+        threading.Thread(target=download_worker, args=(dl_queue, conv_queue), daemon=True)
+        for _ in range(args.download_threads)
+    ]
+    for t in dl_threads:
+        t.start()
+
+    for _ in dl_threads:
+        dl_queue.put(_STOP)
+
+    dl_queue.join()
+
+    for _ in conv_threads:
+        conv_queue.put(_STOP)
+
+    conv_queue.join()
+
+    if raw_files_converted:
+        total_mb = sum(f.stat().st_size for f in raw_files_converted if f.exists()) / (1024 * 1024)
+        answer = input(f"\nDelete {len(raw_files_converted)} raw video files ({total_mb:.1f} MB)? [y/N] ").strip().lower()
+        if answer == "y":
+            for f in raw_files_converted:
+                f.unlink(missing_ok=True)
+            print("Raw files deleted.")
+        else:
+            print("Raw files kept.")
 
     print("Done.")
 
