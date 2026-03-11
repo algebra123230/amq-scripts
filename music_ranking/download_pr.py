@@ -16,6 +16,7 @@ import io
 import argparse
 import threading
 import queue
+import time
 from datetime import date
 from pathlib import Path
 from urllib.parse import urlparse
@@ -173,7 +174,7 @@ def log(msg: str):
 _STOP = object()  # sentinel
 
 
-def download_worker(dl_queue, conv_queue):
+def download_worker(dl_queue, conv_queue, time_lock, download_secs, download_count, errors, errors_lock):
     while True:
         item = dl_queue.get()
         if item is _STOP:
@@ -183,14 +184,19 @@ def download_worker(dl_queue, conv_queue):
         log(f"[{idx}/{n_total}] ↓ {base_name}")
         try:
             dest_base = mp3_dest.with_suffix("")
+            t0 = time.monotonic()
             raw_file = download_raw(media_url, dest_base)
+            with time_lock:
+                download_secs[0] += time.monotonic() - t0
+                download_count[0] += 1
             conv_queue.put((idx, n_total, base_name, raw_file, mp3_dest))
         except Exception as e:
-            log(f"  ERROR downloading [{idx}] {base_name}: {e}")
+            with errors_lock:
+                errors.append((base_name, e))
         dl_queue.task_done()
 
 
-def convert_worker(conv_queue, raw_files_lock, raw_files_converted):
+def convert_worker(conv_queue, raw_files_lock, raw_files_converted, time_lock, convert_secs, convert_count, errors, errors_lock):
     while True:
         item = conv_queue.get()
         if item is _STOP:
@@ -199,11 +205,16 @@ def convert_worker(conv_queue, raw_files_lock, raw_files_converted):
         idx, n_total, base_name, raw_file, mp3_dest = item
         log(f"[{idx}/{n_total}] ♪ {base_name}")
         try:
+            t0 = time.monotonic()
             convert_to_mp3(raw_file, mp3_dest)
+            with time_lock:
+                convert_secs[0] += time.monotonic() - t0
+                convert_count[0] += 1
             with raw_files_lock:
                 raw_files_converted.append(raw_file)
         except Exception as e:
-            log(f"  ERROR converting [{idx}] {base_name}: {e}")
+            with errors_lock:
+                errors.append((f"(convert) {base_name}", e))
         conv_queue.task_done()
 
 
@@ -291,13 +302,23 @@ def main():
     conv_queue: queue.Queue = queue.Queue()
     raw_files_converted: list[Path] = []
     raw_files_lock = threading.Lock()
+    time_lock = threading.Lock()
+    download_secs = [0.0]
+    download_count = [0]
+    convert_secs = [0.0]
+    convert_count = [0]
+    errors: list[tuple[str, Exception]] = []
+    errors_lock = threading.Lock()
 
     for idx, (base_name, media_url, mp3_dest) in enumerate(pending, 1):
         dl_queue.put((idx, n_total, base_name, media_url, mp3_dest))
 
+    t_start = time.monotonic()
+
     conv_threads = [
         threading.Thread(target=convert_worker,
-                         args=(conv_queue, raw_files_lock, raw_files_converted),
+                         args=(conv_queue, raw_files_lock, raw_files_converted,
+                               time_lock, convert_secs, convert_count, errors, errors_lock),
                          daemon=True)
         for _ in range(args.convert_threads)
     ]
@@ -305,7 +326,10 @@ def main():
         t.start()
 
     dl_threads = [
-        threading.Thread(target=download_worker, args=(dl_queue, conv_queue), daemon=True)
+        threading.Thread(target=download_worker,
+                         args=(dl_queue, conv_queue, time_lock, download_secs, download_count,
+                               errors, errors_lock),
+                         daemon=True)
         for _ in range(args.download_threads)
     ]
     for t in dl_threads:
@@ -321,6 +345,8 @@ def main():
 
     conv_queue.join()
 
+    t_end = time.monotonic()
+
     if raw_files_converted:
         total_mb = sum(f.stat().st_size for f in raw_files_converted if f.exists()) / (1024 * 1024)
         answer = input(f"\nDelete {len(raw_files_converted)} raw video files ({total_mb:.1f} MB)? [y/N] ").strip().lower()
@@ -331,6 +357,30 @@ def main():
         else:
             print("Raw files kept.")
 
+    def fmt(secs: float) -> str:
+        m, s = divmod(int(secs), 60)
+        return f"{m}m{s:02d}s" if m else f"{s}s"
+
+    def fmt_avg(total_secs: float, count: int) -> str:
+        if count == 0:
+            return "—"
+        return f"{total_secs / count:.1f}s/file"
+
+    nd, nc = download_count[0], convert_count[0]
+    print(
+        f"\nDownloaded {nd} file{'s' if nd != 1 else ''} in {fmt(download_secs[0])}"
+        f" ({fmt_avg(download_secs[0], nd)})"
+    )
+    print(
+        f"Converted  {nc} file{'s' if nc != 1 else ''} in {fmt(convert_secs[0])}"
+        f" ({fmt_avg(convert_secs[0], nc)})"
+    )
+    print(f"End-to-end: {fmt(t_end - t_start)}")
+
+    if errors:
+        print(f"\n{len(errors)} error{'s' if len(errors) != 1 else ''}:")
+        for name, exc in errors:
+            print(f"  {name}: {exc}")
     print("Done.")
 
 
