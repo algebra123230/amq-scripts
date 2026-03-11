@@ -17,6 +17,7 @@ import argparse
 import threading
 import queue
 import time
+
 from datetime import date
 from pathlib import Path
 from urllib.parse import urlparse
@@ -126,20 +127,24 @@ def download_raw(url: str, dest_base: Path) -> Path:
     is_youtube = "youtube.com" in url or "youtu.be" in url
     if is_youtube:
         output_template = str(dest_base) + ".%(ext)s"
-        subprocess.run(
-            ["yt-dlp", "-f", "bestaudio", "--no-playlist", "-q",
+        result = subprocess.run(
+            ["yt-dlp", "-f", "bestaudio/best", "--no-playlist", "-q",
+             "--remote-components", "ejs:github",
              "-o", output_template, url],
-            check=True,
+            capture_output=True, text=True, stdin=subprocess.DEVNULL,
         )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or f"yt-dlp exited {result.returncode}")
         candidates = [
-            f for f in dest_base.parent.glob(dest_base.name + ".*")
-            if f.suffix not in (".mp3", ".part")
+            f for f in dest_base.parent.iterdir()
+            if f.name.startswith(dest_base.name + ".") and f.suffix not in (".mp3", ".part")
         ]
         if not candidates:
             raise FileNotFoundError(f"yt-dlp produced no output file for {url}")
         return candidates[0]
     else:
-        resp = requests.get(url, stream=True, timeout=120)
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(url, stream=True, timeout=120, headers=headers)
         resp.raise_for_status()
         ext = Path(urlparse(url).path).suffix or ".webm"
         dest = Path(str(dest_base) + ext)
@@ -150,11 +155,12 @@ def download_raw(url: str, dest_base: Path) -> Path:
 
 
 def convert_to_mp3(raw_file: Path, mp3_dest: Path):
-    """Convert raw_file to mp3_dest with ffmpeg."""
+    """Convert raw_file → mp3_dest with ffmpeg."""
     subprocess.run(
         ["ffmpeg", "-i", str(raw_file), "-vn", "-acodec", "libmp3lame", "-q:a", "2",
          "-y", str(mp3_dest)],
         check=True,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -263,6 +269,7 @@ def main():
     print("mp3 column found — will use mp3 links." if mp3_col
           else "No mp3 column — will use Song Info links.")
 
+    # Parse all songs
     songs = []
     for row in ws.iter_rows(min_row=header_row + 1):
         id_cell = row[id_col - 1]
@@ -278,6 +285,7 @@ def main():
         media_url = get_cell_url(row[mp3_col - 1]) if mp3_col else get_cell_url(song_info_cell)
         songs.append((song_id, anime, title, artist, media_url))
 
+    # Filter out already-done and no-URL songs
     pending = []
     skipped = 0
     for song_id, anime, title, artist, media_url in songs:
@@ -310,11 +318,13 @@ def main():
     errors: list[tuple[str, Exception]] = []
     errors_lock = threading.Lock()
 
+    # Enqueue pending songs
     for idx, (base_name, media_url, mp3_dest) in enumerate(pending, 1):
         dl_queue.put((idx, n_total, base_name, media_url, mp3_dest))
 
     t_start = time.monotonic()
 
+    # Start convert workers first (they wait on conv_queue)
     conv_threads = [
         threading.Thread(target=convert_worker,
                          args=(conv_queue, raw_files_lock, raw_files_converted,
@@ -325,6 +335,7 @@ def main():
     for t in conv_threads:
         t.start()
 
+    # Start download workers
     dl_threads = [
         threading.Thread(target=download_worker,
                          args=(dl_queue, conv_queue, time_lock, download_secs, download_count,
@@ -335,21 +346,25 @@ def main():
     for t in dl_threads:
         t.start()
 
+    # Signal download workers to stop after queue is drained
     for _ in dl_threads:
         dl_queue.put(_STOP)
 
-    dl_queue.join()
+    dl_queue.join()  # wait for all downloads (and their conv_queue.put calls) to finish
 
+    # Signal convert workers to stop
     for _ in conv_threads:
         conv_queue.put(_STOP)
 
-    conv_queue.join()
+    conv_queue.join()  # wait for all conversions to finish
 
     t_end = time.monotonic()
 
     if raw_files_converted:
         total_mb = sum(f.stat().st_size for f in raw_files_converted if f.exists()) / (1024 * 1024)
-        answer = input(f"\nDelete {len(raw_files_converted)} raw video files ({total_mb:.1f} MB)? [y/N] ").strip().lower()
+        subprocess.run(["stty", "sane"], check=False)
+        prompt = f"\nDelete {len(raw_files_converted)} raw video files ({total_mb:.1f} MB)? [y/N] "
+        answer = input(prompt).strip().lower()
         if answer == "y":
             for f in raw_files_converted:
                 f.unlink(missing_ok=True)
@@ -364,7 +379,8 @@ def main():
     def fmt_avg(total_secs: float, count: int) -> str:
         if count == 0:
             return "—"
-        return f"{total_secs / count:.1f}s/file"
+        avg = total_secs / count
+        return f"{avg:.1f}s/file"
 
     nd, nc = download_count[0], convert_count[0]
     print(
@@ -378,7 +394,7 @@ def main():
     print(f"End-to-end: {fmt(t_end - t_start)}")
 
     if errors:
-        print(f"\n{len(errors)} error{'s' if len(errors) != 1 else ''}:")
+        print(f"\n{len(errors)} download error{'s' if len(errors) != 1 else ''}:")
         for name, exc in errors:
             print(f"  {name}: {exc}")
     print("Done.")
