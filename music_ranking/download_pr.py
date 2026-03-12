@@ -11,6 +11,7 @@ Usage:
 
 import re
 import sys
+import platform
 import subprocess
 import io
 import argparse
@@ -73,7 +74,7 @@ def parse_song_info(text: str):
 
 def get_cell_url(cell) -> str | None:
     if cell.hyperlink:
-        target = cell.hyperlink.target if hasattr(cell.hyperlink, 'target') else str(cell.hyperlink)
+        target = cell.hyperlink.target
         if target:
             return target
     val = str(cell.value).strip() if cell.value else ""
@@ -239,6 +240,17 @@ def convert_worker(conv_queue, raw_files_lock, raw_files_converted, conv_lock, c
 # Main
 # ---------------------------------------------------------------------------
 
+def fmt(secs: float) -> str:
+    m, s = divmod(int(secs), 60)
+    return f"{m}m{s:02d}s" if m else f"{s}s"
+
+
+def fmt_avg(total_secs: float, count: int) -> str:
+    if count == 0:
+        return "—"
+    return f"{total_secs / count:.1f}s/file"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Download PR songs as mp3.")
     parser.add_argument("sheet_url", help="Google Sheet URL or sheet ID")
@@ -372,7 +384,9 @@ def main():
 
     if raw_files_converted:
         total_mb = sum(f.stat().st_size for f in raw_files_converted if f.exists()) / (1024 * 1024)
-        subprocess.run(["stty", "sane"], check=False)
+        # ffmpeg modifies terminal settings even with redirected I/O; restore them before prompting
+        if platform.system() != "Windows":
+            subprocess.run(["stty", "sane"], check=False)
         prompt = f"\nDelete {len(raw_files_converted)} raw video files ({total_mb:.1f} MB)? [y/N] "
         answer = input(prompt).strip().lower()
         if answer == "y":
@@ -381,16 +395,6 @@ def main():
             print("Raw files deleted.")
         else:
             print("Raw files kept.")
-
-    def fmt(secs: float) -> str:
-        m, s = divmod(int(secs), 60)
-        return f"{m}m{s:02d}s" if m else f"{s}s"
-
-    def fmt_avg(total_secs: float, count: int) -> str:
-        if count == 0:
-            return "—"
-        avg = total_secs / count
-        return f"{avg:.1f}s/file"
 
     nd, nc = dl_stats.count, conv_stats.count
     print(
