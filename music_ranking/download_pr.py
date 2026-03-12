@@ -182,7 +182,7 @@ def log(msg: str):
 _STOP = object()  # sentinel
 
 
-def download_worker(dl_queue, conv_queue, time_lock, download_secs, download_count, errors, errors_lock):
+def download_worker(dl_queue, conv_queue, dl_lock, download_secs, download_count, errors, errors_lock):
     while True:
         item = dl_queue.get()
         if item is _STOP:
@@ -190,21 +190,24 @@ def download_worker(dl_queue, conv_queue, time_lock, download_secs, download_cou
             break
         idx, n_total, base_name, media_url, mp3_dest = item
         log(f"[{idx}/{n_total}] ↓ {base_name}")
+        dest_base = mp3_dest.with_suffix("")
         try:
-            dest_base = mp3_dest.with_suffix("")
             t0 = time.monotonic()
             raw_file = download_raw(media_url, dest_base)
-            with time_lock:
+            with dl_lock:
                 download_secs[0] += time.monotonic() - t0
                 download_count[0] += 1
             conv_queue.put((idx, n_total, base_name, raw_file, mp3_dest))
         except Exception as e:
+            for f in dest_base.parent.iterdir():
+                if f.stem == dest_base.name:
+                    f.unlink(missing_ok=True)
             with errors_lock:
                 errors.append((base_name, e))
         dl_queue.task_done()
 
 
-def convert_worker(conv_queue, raw_files_lock, raw_files_converted, time_lock, convert_secs, convert_count, errors, errors_lock):
+def convert_worker(conv_queue, raw_files_lock, raw_files_converted, conv_lock, convert_secs, convert_count, errors, errors_lock):
     while True:
         item = conv_queue.get()
         if item is _STOP:
@@ -215,7 +218,7 @@ def convert_worker(conv_queue, raw_files_lock, raw_files_converted, time_lock, c
         try:
             t0 = time.monotonic()
             convert_to_mp3(raw_file, mp3_dest)
-            with time_lock:
+            with conv_lock:
                 convert_secs[0] += time.monotonic() - t0
                 convert_count[0] += 1
             with raw_files_lock:
@@ -312,9 +315,10 @@ def main():
     conv_queue: queue.Queue = queue.Queue()
     raw_files_converted: list[Path] = []
     raw_files_lock = threading.Lock()
-    time_lock = threading.Lock()
+    dl_lock = threading.Lock()
     download_secs = [0.0]
     download_count = [0]
+    conv_lock = threading.Lock()
     convert_secs = [0.0]
     convert_count = [0]
     errors: list[tuple[str, Exception]] = []
@@ -330,7 +334,7 @@ def main():
     conv_threads = [
         threading.Thread(target=convert_worker,
                          args=(conv_queue, raw_files_lock, raw_files_converted,
-                               time_lock, convert_secs, convert_count, errors, errors_lock),
+                               conv_lock, convert_secs, convert_count, errors, errors_lock),
                          daemon=True)
         for _ in range(args.convert_threads)
     ]
@@ -340,7 +344,7 @@ def main():
     # Start download workers
     dl_threads = [
         threading.Thread(target=download_worker,
-                         args=(dl_queue, conv_queue, time_lock, download_secs, download_count,
+                         args=(dl_queue, conv_queue, dl_lock, download_secs, download_count,
                                errors, errors_lock),
                          daemon=True)
         for _ in range(args.download_threads)
