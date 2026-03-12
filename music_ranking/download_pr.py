@@ -17,6 +17,7 @@ import argparse
 import threading
 import queue
 import time
+from dataclasses import dataclass, field
 
 from datetime import date
 from pathlib import Path
@@ -172,6 +173,11 @@ def convert_to_mp3(raw_file: Path, mp3_dest: Path):
 # Worker threads
 # ---------------------------------------------------------------------------
 
+@dataclass
+class Stats:
+    secs: float = 0.0
+    count: int = 0
+
 _print_lock = threading.Lock()
 
 def log(msg: str):
@@ -182,7 +188,7 @@ def log(msg: str):
 _STOP = object()  # sentinel
 
 
-def download_worker(dl_queue, conv_queue, dl_lock, download_secs, download_count, errors, errors_lock):
+def download_worker(dl_queue, conv_queue, dl_lock, dl_stats, errors, errors_lock):
     while True:
         item = dl_queue.get()
         if item is _STOP:
@@ -195,8 +201,8 @@ def download_worker(dl_queue, conv_queue, dl_lock, download_secs, download_count
             t0 = time.monotonic()
             raw_file = download_raw(media_url, dest_base)
             with dl_lock:
-                download_secs[0] += time.monotonic() - t0
-                download_count[0] += 1
+                dl_stats.secs += time.monotonic() - t0
+                dl_stats.count += 1
             conv_queue.put((idx, n_total, base_name, raw_file, mp3_dest))
         except Exception as e:
             for f in dest_base.parent.iterdir():
@@ -207,7 +213,7 @@ def download_worker(dl_queue, conv_queue, dl_lock, download_secs, download_count
         dl_queue.task_done()
 
 
-def convert_worker(conv_queue, raw_files_lock, raw_files_converted, conv_lock, convert_secs, convert_count, errors, errors_lock):
+def convert_worker(conv_queue, raw_files_lock, raw_files_converted, conv_lock, conv_stats, errors, errors_lock):
     while True:
         item = conv_queue.get()
         if item is _STOP:
@@ -219,8 +225,8 @@ def convert_worker(conv_queue, raw_files_lock, raw_files_converted, conv_lock, c
             t0 = time.monotonic()
             convert_to_mp3(raw_file, mp3_dest)
             with conv_lock:
-                convert_secs[0] += time.monotonic() - t0
-                convert_count[0] += 1
+                conv_stats.secs += time.monotonic() - t0
+                conv_stats.count += 1
             with raw_files_lock:
                 raw_files_converted.append(raw_file)
         except Exception as e:
@@ -316,11 +322,9 @@ def main():
     raw_files_converted: list[Path] = []
     raw_files_lock = threading.Lock()
     dl_lock = threading.Lock()
-    download_secs = [0.0]
-    download_count = [0]
+    dl_stats = Stats()
     conv_lock = threading.Lock()
-    convert_secs = [0.0]
-    convert_count = [0]
+    conv_stats = Stats()
     errors: list[tuple[str, Exception]] = []
     errors_lock = threading.Lock()
 
@@ -334,7 +338,7 @@ def main():
     conv_threads = [
         threading.Thread(target=convert_worker,
                          args=(conv_queue, raw_files_lock, raw_files_converted,
-                               conv_lock, convert_secs, convert_count, errors, errors_lock),
+                               conv_lock, conv_stats, errors, errors_lock),
                          daemon=True)
         for _ in range(args.convert_threads)
     ]
@@ -344,7 +348,7 @@ def main():
     # Start download workers
     dl_threads = [
         threading.Thread(target=download_worker,
-                         args=(dl_queue, conv_queue, dl_lock, download_secs, download_count,
+                         args=(dl_queue, conv_queue, dl_lock, dl_stats,
                                errors, errors_lock),
                          daemon=True)
         for _ in range(args.download_threads)
@@ -388,14 +392,14 @@ def main():
         avg = total_secs / count
         return f"{avg:.1f}s/file"
 
-    nd, nc = download_count[0], convert_count[0]
+    nd, nc = dl_stats.count, conv_stats.count
     print(
-        f"\nDownloaded {nd} file{'s' if nd != 1 else ''} in {fmt(download_secs[0])}"
-        f" ({fmt_avg(download_secs[0], nd)})"
+        f"\nDownloaded {nd} file{'s' if nd != 1 else ''} in {fmt(dl_stats.secs)}"
+        f" ({fmt_avg(dl_stats.secs, nd)})"
     )
     print(
-        f"Converted  {nc} file{'s' if nc != 1 else ''} in {fmt(convert_secs[0])}"
-        f" ({fmt_avg(convert_secs[0], nc)})"
+        f"Converted  {nc} file{'s' if nc != 1 else ''} in {fmt(conv_stats.secs)}"
+        f" ({fmt_avg(conv_stats.secs, nc)})"
     )
     print(f"End-to-end: {fmt(t_end - t_start)}")
 
